@@ -213,15 +213,21 @@
 #define OPTIBOOT_MAJVER 6
 #define OPTIBOOT_MINVER 0
 
-/*
- * OPTIBOOT_CUSTOMVER should be defined (by the makefile) for custom edits
- * of optiboot.  That way you don't wind up with very different code that
- * matches the version number of a "released" optiboot.
- */
+// chda patch version
+#define OPTIBOOT_CUSTOM_MINVER 1
 
-#if !defined(OPTIBOOT_CUSTOMVER)
-#define OPTIBOOT_CUSTOMVER 0
+#if defined(__AVR_ATmega328PB__)
+#define OPTIBOOT_CUSTOM_PLATFORM_VERSION 0xD0
+#elif defined(__AVR_ATmega328P__)
+#define OPTIBOOT_CUSTOM_PLATFORM_VERSION 0xC0
+#else
+#error "Unsupported platform"
 #endif
+#define OPTIBOOT_CUSTOMVER ( OPTIBOOT_CUSTOM_PLATFORM_VERSION + OPTIBOOT_CUSTOM_MINVER )
+
+// Make compiler happy
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 
 unsigned int __attribute__((section(".version"))) optiboot_version = 256*OPTIBOOT_MAJVER + OPTIBOOT_MINVER + OPTIBOOT_CUSTOMVER;
 
@@ -251,6 +257,11 @@ unsigned int __attribute__((section(".version"))) optiboot_version = 256*OPTIBOO
  * stk500.h contains the constant definitions for the stk500v1 comm protocol
  */
 #include "stk500.h"
+
+/*
+ * boot_status.h contains the definitions for bootStatus values
+ */
+#include "boot_status.h"
 
 #ifndef LED_START_FLASHES
 #define LED_START_FLASHES 0
@@ -311,6 +322,14 @@ unsigned int __attribute__((section(".version"))) optiboot_version = 256*OPTIBOO
 #endif // baud rate fastn check
 #endif
 
+/* We need some delay before an answer for RS485 TX/RX mode change.
+ * Delay will be 3 CPU cycles per loop for DELAY_LOOPS.
+ * If DELAY_LOOPS==0 it'll perform 256 cycles (the maximum), in total = 768 CPU cycles
+ * (48us for 16MHz or approx. 3 bits at 57600 bps).
+ * Minimal delay will be 3 CPU cycles if DELAY_LOOPS==1.
+ */
+#define DELAY_LOOPS     0
+
 /* Watchdog settings */
 #define WATCHDOG_OFF    (0)
 #define WATCHDOG_16MS   (_BV(WDE))
@@ -335,13 +354,17 @@ unsigned int __attribute__((section(".version"))) optiboot_version = 256*OPTIBOO
 
 int main(void) __attribute__ ((OS_main)) __attribute__ ((section (".init9")));
 
+void __attribute__((noinline)) setBootStatus(uint8_t);
+void __attribute__((noinline)) reboot(uint8_t);
 void __attribute__((noinline)) putch(char);
 uint8_t __attribute__((noinline)) getch(void);
 uint16_t __attribute__((noinline)) getLen(void);
 static inline void getNch(uint8_t);
 
 void __attribute__((noinline)) verifySpace();
+#if LED_START_FLASHES > 0
 static inline void flash_led(uint8_t);
+#endif
 
 static inline void watchdogReset();
 void __attribute__((noinline)) watchdogConfig(uint8_t x);
@@ -354,7 +377,7 @@ static inline void read_mem(uint8_t memtype,
 #ifdef SOFT_UART
 void uartDelay() __attribute__ ((naked));
 #endif
-void appStart(uint8_t rstFlags) __attribute__ ((naked));
+void appStart(void) __attribute__ ((naked));
 
 /*
  * RAMSTART should be self-explanatory.  It's bigger on parts with a
@@ -376,10 +399,12 @@ void appStart(uint8_t rstFlags) __attribute__ ((naked));
 /* C zero initialises all global variables. However, that requires */
 /* These definitions are NOT zero initialised, but that doesn't matter */
 /* This allows us to drop the zero init code, saving us memory */
-#define buff    ((uint8_t*)(RAMSTART))
+#define bootStatus ((uint8_t*)(RAMSTART))
+#define lastMCUSR ((uint8_t*)(RAMSTART+1))
+#define buff    ((uint8_t*)(RAMSTART+2))
 #ifdef VIRTUAL_BOOT_PARTITION
-#define rstVect (*(uint16_t*)(RAMSTART+SPM_PAGESIZE*2+4))
-#define wdtVect (*(uint16_t*)(RAMSTART+SPM_PAGESIZE*2+6))
+#define rstVect (*(uint16_t*)(RAMSTART+SPM_PAGESIZE*2+6))
+#define wdtVect (*(uint16_t*)(RAMSTART+SPM_PAGESIZE*2+8))
 #endif
 
 
@@ -393,7 +418,7 @@ int main(void) {
    * (initializing address keeps the compiler happy, but isn't really
    *  necessary, and uses 4 bytes of flash.)
    */
-  register uint16_t address = 0;
+  register uint16_t address;
   register uint16_t  length;
 
   // After the zero init loop, this is the first code to run.
@@ -410,10 +435,24 @@ int main(void) {
   SP=RAMEND;  // This is done by hardware reset
 #endif
 
+  // Increase watchdog timer for manual firmware upload start
+  watchdogConfig(WATCHDOG_1S);
+  // watchdogReset();
+
   // Adaboot no-wait mod
-  ch = MCUSR;
+  // with chda modifications
+  // Main program will get bootStatus at RAMSTART and lastMCUSR at next byte
+  // The aim is to achieve such values:
+  // (Boot event                   | bootStatus | lastMCUSR)
+  // On first power-on             | 0          | _BV(PORF)
+  // On brown-out                  | 0          | _BV(BORF)
+  // On watchdog from main program | 0          | _BV(WDRF)
+  // On reset button               | non-zero   | _BV(WDRF)
+  if (!((*lastMCUSR) & _BV(EXTRF))) setBootStatus(BOOT_NO_FWUPG_REQUESTED);
+  *lastMCUSR = MCUSR;
   MCUSR = 0;
-  if (!(ch & _BV(EXTRF))) appStart(ch);
+  if (!((*lastMCUSR) & _BV(EXTRF))) appStart();
+  setBootStatus(BOOT_SILENCE);  // Next getch may freeze until watchdog reboot. So return correct status
 
 #if LED_START_FLASHES > 0
   // Set up Timer 1 for timeout counter
@@ -436,11 +475,8 @@ int main(void) {
 
 #ifdef RS485
   RS485_DDR |= _BV(RS485);
-  RS485_PORT &= ~_BV(RS485);
+  // RS485_PORT &= ~_BV(RS485);  // This bit is zero already. We can save 2 bytes by commenting this line
 #endif
-
-  // Set up watchdog to trigger after 500ms
-  watchdogConfig(WATCHDOG_1S);
 
 #if (LED_START_FLASHES > 0) || defined(LED_DATA_FLASH)
   /* Set LED pin as output */
@@ -462,21 +498,29 @@ int main(void) {
     /* get character from UART */
     ch = getch();
 
-    if(ch == STK_GET_PARAMETER) {
+    if(ch == STK_GET_SYNC) {
+      verifySpace();
+      setBootStatus(BOOT_FWUPG_UNFINISHED);
+    }
+    else if(*bootStatus == BOOT_SILENCE) {
+      // STK_GET_SYNC is the only allowed from BOOT_SILENCE
+      reboot(BOOT_BUS_BUSY);
+    }
+    else if(ch == STK_GET_PARAMETER) {
       unsigned char which = getch();
       verifySpace();
       if (which == 0x82) {
         /*
-         * Send optiboot version as "minor SW version"
-         */
-        putch(OPTIBOOT_MINVER);
+        * Send optiboot version as "minor SW version"
+        */
+        putch(OPTIBOOT_MINVER+OPTIBOOT_CUSTOMVER);
       } else if (which == 0x81) {
           putch(OPTIBOOT_MAJVER);
       } else {
         /*
-         * GET PARAMETER returns a generic 0x03 reply for
-         * other parameters - enough to keep Avrdude happy
-         */
+        * GET PARAMETER returns a generic 0x03 reply for
+        * other parameters - enough to keep Avrdude happy
+        */
         putch(0x03);
       }
     }
@@ -490,14 +534,16 @@ int main(void) {
     }
     else if(ch == STK_LOAD_ADDRESS) {
       // LOAD ADDRESS
-      uint16_t newAddress;
+      uint16_t newAddress = 0;
       newAddress = getch();
-      newAddress = (newAddress & 0xff) | (getch() << 8);
 #ifdef RAMPZ
       // Transfer top bit to RAMPZ
+      newAddress = (newAddress & 0xff) | (getch() << 8);
       RAMPZ = (newAddress & 0x8000) ? 1 : 0;
-#endif
       newAddress += newAddress; // Convert from word address to byte address
+#else
+      newAddress = ((newAddress & 0xff) | (getch() << 8))<<1;
+#endif
       address = newAddress;
       verifySpace();
     }
@@ -568,9 +614,11 @@ int main(void) {
       putch(SIGNATURE_2);
     }
     else if (ch == STK_LEAVE_PROGMODE) { /* 'Q' */
-      // Adaboot no-wait mod
-      watchdogConfig(WATCHDOG_16MS);
       verifySpace();
+      // putch(STK_OK);
+      // reboot(BOOT_FWUPG_SUCCESS);
+      setBootStatus(BOOT_FWUPG_SUCCESS);
+      // watchdogConfig(WATCHDOG_16MS);  // Give time to putch(STK_OK), then reboot
     }
     else {
       // This covers the response to commands like STK_ENTER_PROGMODE
@@ -578,6 +626,16 @@ int main(void) {
     }
     putch(STK_OK);
   }
+}
+
+void setBootStatus(uint8_t state) {
+  *bootStatus = state;
+}
+
+void reboot(uint8_t state) {
+  setBootStatus(state);             // Save bootloader state before reboot
+  watchdogConfig(WATCHDOG_16MS);  // Shorten watchdog timer
+  while (1);  // Reboot, so main program should start
 }
 
 void putch(char ch) {
@@ -598,15 +656,15 @@ void putch(char ch) {
   while (!(UART_SRA & _BV(TXC0)));
   // put transceiver to input mode
   RS485_PORT &= ~_BV(RS485);
-#else
+#else // ! RS485
   while (!(UART_SRA & _BV(UDRE0)));
   UART_UDR = ch;
-#endif
-#else
+#endif // RS485
+#else // SOFT_UART
 #ifdef RS485
   // put transceiver to output mode
   RS485_PORT |= _BV(RS485);
-#endif
+#endif // RS485
   __asm__ __volatile__ (
     "   com %[ch]\n" // ones complement, carry set
     "   sec\n"
@@ -633,7 +691,7 @@ void putch(char ch) {
   // put transceiver to input mode
   RS485_PORT &= ~_BV(RS485);
 #endif
-#endif
+#endif // SOFT_UART
 }
 
 uint8_t getch(void) {
@@ -674,7 +732,7 @@ uint8_t getch(void) {
 #else
   while(!(UART_SRA & _BV(RXC0)))
     ;
-  if (!(UART_SRA & _BV(FE0))) {
+  if ((UART_SRA & _BV(FE0))) {
       /*
        * A Framing Error indicates (probably) that something is talking
        * to us at the wrong bit rate.  Assume that this is because it
@@ -683,10 +741,11 @@ uint8_t getch(void) {
        * the application "soon", if it keeps happening.  (Note that we
        * don't care that an invalid char is returned...)
        */
-    watchdogReset();
+    // watchdogReset();
+    ch = UART_UDR & 0;
+  } else {
+    ch = UART_UDR;
   }
-
-  ch = UART_UDR;
 #endif
 
 #ifdef LED_DATA_FLASH
@@ -732,11 +791,24 @@ void getNch(uint8_t count) {
 }
 
 void verifySpace() {
-  if (getch() != CRC_EOP) {
-    watchdogConfig(WATCHDOG_16MS);    // shorten WD timeout
-    while (1)                         // and busy-loop so that WD causes
-      ;                               //  a reset and app start.
-  }
+  if (getch() != CRC_EOP)
+    reboot(BOOT_FWUPG_INVALID_CMD);
+  watchdogReset();
+#ifdef RS485
+    /* Make some delay for RS485 receiver to switch TX/RX mode.
+     * To save yet another 2 bytes you may comment out ldi instruction.
+     * Assuming that r23 equals 0 at this point always.
+     */
+    __asm__ __volatile__ (
+            "ldi r23, %[count]\n"
+        "1:\n"
+            "dec r23\n"
+            "brne 1b\n"
+        :   // No outputs
+        :   [count] "M" (DELAY_LOOPS)
+        :   "r23"
+    );
+#endif
   putch(STK_INSYNC);
 }
 
@@ -751,7 +823,7 @@ void flash_led(uint8_t count) {
 #else
     LED_PIN |= _BV(LED);
 #endif
-    watchdogReset();
+    // watchdogReset();
   } while (--count);
 }
 #endif
@@ -768,13 +840,14 @@ void watchdogConfig(uint8_t x) {
   WDTCSR = x;
 }
 
-void appStart(uint8_t rstFlags) {
+void appStart(void) {
   // save the reset flags in the designated register
   //  This can be saved in a main program by putting code in .init0 (which
   //  executes before normal c init code) to save R2 to a global variable.
-  __asm__ __volatile__ ("mov r2, %0\n" :: "r" (rstFlags));
+  // __asm__ __volatile__ ("mov r2, %0\n" :: "r" (rstFlags));
 
-  watchdogConfig(WATCHDOG_OFF);
+  watchdogReset();
+  // watchdogConfig(WATCHDOG_OFF);
   __asm__ __volatile__ (
 #ifdef VIRTUAL_BOOT_PARTITION
     // Jump to WDT vector
@@ -807,8 +880,7 @@ static inline void writebuffer(int8_t memtype, uint8_t *mybuff,
          * until the WDT expires, which will eventually cause an error on
          * host system (which is what it should do.)
          */
-        while (1)
-            ; // Error: wait for WDT
+        reboot(BOOT_FWUPG_INVALID_CMD); // Error: wait for WDT
 #endif
         break;
     default:  // FLASH

@@ -1,0 +1,15 @@
+#!/bin/bash
+
+#if [ "${PATH%%arduino}" == "$PATH" ]; then
+#    export PATH="/opt/arduino-1.8.6/hardware/tools/avr/bin:$PATH"
+#fi
+
+#export AVRDUDE_CONF="-C/opt/arduino-1.8.6/hardware/tools/avr/etc/avrdude.conf"
+export AVRDUDE_CONF="-C/etc/avrdude.conf"
+export ISPTOOL=usbasp
+export ISPPORT=/dev/usbasp
+#export ISPSPEED=-b19200
+
+make -C optiboot AVRDUDE_CONF="$AVRDUDE_CONF" BAUD_RATE=57600 RS485=B5 LED_START_FLASHES=0 LED=B5 EFUSE=FC clean atmega328pb_isp
+#make -C optiboot AVRDUDE_CONF="$AVRDUDE_CONF" BAUD_RATE=57600 RS485=D4 LED_START_FLASHES=2 LED_DATA_FLASH=1 clean atmega328pb_isp
+#make -C optiboot BAUD_RATE=57600 RS485=D4 LED_START_FLASHES=2 LED_DATA_FLASH=1 clean atmega328pb_isp
